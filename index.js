@@ -2,7 +2,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { MongoClient, ServerApiVersion } from 'mongodb';
+import { MongoClient, ObjectId, ServerApiVersion } from 'mongodb';
 
 
 // Load environment variables from .env
@@ -36,11 +36,23 @@ async function run() {
     const db = client.db("parcelDB");
     const parcelsCollection = db.collection("parcels");
 
-    // get all data from parcelDB database
+    //get all parcels OR get parcel by userEmail (created_by), sort by latest
     app.get("/parcels", async (req, res) => {
-      const parcels = await parcelsCollection.find().toArray()
-      res.send(parcels)
-    })
+      try {
+        const userEmail = req.query.email;
+        const query = userEmail ? { createdBy: userEmail } : {};
+
+        const parcels = await parcelsCollection
+          .find(query)
+          .sort({ createdAt: -1 }) // লেটেস্ট ডাটা আগে আসবে
+          .toArray();
+
+        res.send(parcels);
+      } catch (error) {
+        console.error("Error fetching parcels: ", error);
+        res.status(500).send({ message: "Failed to get parcels" });
+      }
+    });
 
     // save parcels in database
     app.post("/parcels", async (req, res) => {
@@ -48,6 +60,21 @@ async function run() {
       const result = await parcelsCollection.insertOne(parcelsData)
       res.send(result)
     })
+
+    // delete parcel by ID
+    app.delete('/parcels/:id', async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        const query = { _id: new ObjectId(id) };
+        const result = await parcelsCollection.deleteOne(query);
+
+        res.send(result)
+      } catch (error) {
+        console.error("Delete Error:", error);
+        res.status(500).json({ message: "Internal Server Error" });
+      }
+    });
 
 
 
