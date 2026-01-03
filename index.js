@@ -1,20 +1,32 @@
 // server.js
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import Stripe from 'stripe';
-import { MongoClient, ObjectId, ServerApiVersion } from 'mongodb';
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import Stripe from "stripe";
+import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
+import admin from "firebase-admin";
+import { createRequire } from "module";
 
 dotenv.config();
 
+// 🔹 createRequire for JSON import
+const require = createRequire(import.meta.url);
+const serviceAccount = require("./firebase-admin-key.json");
+
+// 🔹 Firebase Admin Init
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
 const app = express();
 const port = process.env.PORT || 4000;
-const stripe = new Stripe(process.env.PAYMENT_GATEWAY_KEY)
+const stripe = new Stripe(process.env.PAYMENT_GATEWAY_KEY);
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
+// MongoDB URI
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.dmc2js1.mongodb.net/?appName=Cluster0`;
 
 const client = new MongoClient(uri, {
@@ -22,153 +34,169 @@ const client = new MongoClient(uri, {
     version: ServerApiVersion.v1,
     strict: true,
     deprecationErrors: true,
-  }
+  },
 });
+
+// 🔐 Firebase Token Verify Middleware
+const verifyFBToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).send({ message: "unauthorized access" });
+  }
+
+  const token = authHeader.split(" ")[1];
+  if (!token) {
+    return res.status(401).send({ message: "unauthorized access" });
+  }
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.decoded = decoded;
+    next();
+  } catch (error) {
+    return res.status(403).send({ message: "forbidden access" });
+  }
+};
 
 async function run() {
   try {
     await client.connect();
     console.log("✅ MongoDB Connected");
 
-    const db = client.db("parcelDB"); //database name
-    const parcelsCollection = db.collection("parcels"); // database collection
-    const paymentsCollection = db.collection("payments"); //database collection
+    const db = client.db("parcelDB");
+    const usersCollection = db.collection("users");
+    const parcelsCollection = db.collection("parcels");
+    const paymentsCollection = db.collection("payments");
 
-    // get all parcels OR by email
-    app.get("/parcels", async (req, res) => {
-      try {
-        const userEmail = req.query.email;
-        const query = userEmail ? { createdBy: userEmail } : {};
+    // Save user
+    app.post("/users", async (req, res) => {
+      const { email } = req.body;
+      const userExists = await usersCollection.findOne({ email });
 
-        const parcels = await parcelsCollection
-          .find(query)
-          .sort({ creation_date: -1 }) // ✔ correct field
-          .toArray();
-
-        res.send(parcels);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to get parcels" });
+      if (userExists) {
+        return res.send({ message: "user already exists", inserted: false });
       }
+
+      const result = await usersCollection.insertOne(req.body);
+      res.send(result);
     });
 
-    // get parcel by id
+    // Get parcels
+    app.get("/parcels", verifyFBToken, async (req, res) => {
+      const email = req.query.email;
+
+      if (email && req.decoded.email !== email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+
+      const query = email ? { createdBy: email } : {};
+      const parcels = await parcelsCollection
+        .find(query)
+        .sort({ creation_date: -1 })
+        .toArray();
+
+      res.send(parcels);
+    });
+
+    // Get parcel by id
     app.get("/parcels/:id", async (req, res) => {
-      const id = req.params.id;
       const parcel = await parcelsCollection.findOne({
-        _id: new ObjectId(id)
+        _id: new ObjectId(req.params.id),
       });
       res.send(parcel);
     });
 
-    // create parcel
+    // Create parcel
     app.post("/parcels", async (req, res) => {
       const result = await parcelsCollection.insertOne(req.body);
       res.send(result);
     });
 
-    // delete parcel
+    // Delete parcel
     app.delete("/parcels/:id", async (req, res) => {
-      const id = req.params.id;
       const result = await parcelsCollection.deleteOne({
-        _id: new ObjectId(id)
+        _id: new ObjectId(req.params.id),
       });
       res.send(result);
     });
 
-    // internasnal payment gateway (stripe) related api 
-    app.post('/create-payment-intent', async (req, res) => {
-      const amountInCents = req.body.amountInCents
-      try {
-        const paymentIntent = await stripe.paymentIntents.create({
-          amount: amountInCents, // Amount in cents
-          currency: 'usd',
-          payment_method_types: ['card'],
-        });
+    // Stripe payment intent
+    app.post("/create-payment-intent", async (req, res) => {
+      const { amountInCents } = req.body;
 
-        res.json({ clientSecret: paymentIntent.client_secret })
-      } catch (error) {
-        res.status(500).json({ error: error.message });
-      }
-    })
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amountInCents,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
 
-    // Stripe related api --> Update parcel payment status , Save payment history
+      res.send({ clientSecret: paymentIntent.client_secret });
+    });
+
+    // Save payment & update parcel
     app.post("/payments", async (req, res) => {
-      try {
-        const { parcelId, userEmail, amount, paymentMethod, transactionId } = req.body;
+      const { parcelId, userEmail, amount, paymentMethod, transactionId } =
+        req.body;
 
-        // 1️⃣ Update parcel payment status
-        const parcelUpdateResult = await parcelsCollection.updateOne(
-          { _id: new ObjectId(parcelId) },
-          {
-            $set: {
-              payment_status: "paid",
-              transactionId,
-              paidAt: new Date()
-            }
-          }
-        );
+      await parcelsCollection.updateOne(
+        { _id: new ObjectId(parcelId) },
+        {
+          $set: {
+            payment_status: "paid",
+            transactionId,
+            paidAt: new Date(),
+          },
+        }
+      );
 
-        // 2️⃣ Save payment history
-        const paymentDoc = {
-          parcelId: new ObjectId(parcelId),
-          userEmail,
-          amount,
-          paymentMethod,
-          transactionId,
-          status: "success",
-          paid_at_string: new Date().toISOString(),
-          paid_at: new Date()
-        };
+      const paymentDoc = {
+        parcelId: new ObjectId(parcelId),
+        userEmail,
+        amount,
+        paymentMethod,
+        transactionId,
+        status: "success",
+        paid_at: new Date(),
+      };
 
-        const paymentResult = await paymentsCollection.insertOne(paymentDoc);
+      const paymentResult = await paymentsCollection.insertOne(paymentDoc);
 
-        res.send({
-          success: true,
-          message: "Payment successful",
-          parcelUpdateResult,
-          paymentResult
-        });
-
-      } catch (error) {
-        console.error("Payment Error:", error);
-        res.status(500).send({ success: false, message: "Payment failed" });
-      }
+      res.send({
+        success: true,
+        message: "Payment successful",
+        paymentResult,
+      });
     });
 
-    // Stripe related api --> Get Payment History by User
-    app.get("/payments", async (req, res) => {
-      try {
-        const email = req.query.email;
-        const query = email ? { userEmail: email } : {};
+    // Get payment history
+    app.get("/payments", verifyFBToken, async (req, res) => {
+      const email = req.query.email;
 
-        const payments = await paymentsCollection
-          .find(query)
-          .sort({ paid_at: -1 }) // ✅ latest first
-          .toArray();
-
-        res.send(payments);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to load payments" });
+      if (req.decoded.email !== email) {
+        return res.status(403).send({ message: "forbidden access" });
       }
+
+      const payments = await paymentsCollection
+        .find({ userEmail: email })
+        .sort({ paid_at: -1 })
+        .toArray();
+
+      res.send(payments);
     });
-
-
-
   } catch (error) {
     console.error("❌ Server Error:", error);
   }
 }
 
+run();
 
-
-// root route
+// Root route
 app.get("/", (req, res) => {
   res.send("profast server is running successfully!");
 });
 
-// start server
+// Start server
 app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
 });
-
-run().catch(console.dir);
