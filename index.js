@@ -68,6 +68,7 @@ async function run() {
     const usersCollection = db.collection("users");
     const parcelsCollection = db.collection("parcels");
     const paymentsCollection = db.collection("payments");
+    const ridersCollection = db.collection("riders");
 
     // Save user
     app.post("/users", async (req, res) => {
@@ -184,6 +185,45 @@ async function run() {
 
       res.send(payments);
     });
+
+    // Create riders
+    app.post("/riders", async (req, res) => {
+      const rider = req.body
+      const result = await ridersCollection.insertOne(rider)
+      res.send(result)
+    })
+
+    // Get riders
+    app.get("/riders", verifyFBToken, async (req, res) => {
+      const riders = await ridersCollection.find().toArray();
+      res.send(riders);
+    });
+
+    // delete rider
+    app.delete("/riders/:id", async (req, res) => {
+      const id = req.params.id;
+
+      const query = { _id: new ObjectId(id) };
+      const result = await ridersCollection.deleteOne(query);
+
+      res.send(result);
+    });
+
+    // change status (pending -> active)
+    app.patch("/riders/:id", async (req, res) => {
+      const id = req.params.id;
+
+      const query = { _id: new ObjectId(id) };
+      const updateDoc = {
+        $set: {
+          status: "active",
+        },
+      };
+
+      const result = await ridersCollection.updateOne(query, updateDoc);
+      res.send(result);
+    });
+
   } catch (error) {
     console.error("❌ Server Error:", error);
   }
