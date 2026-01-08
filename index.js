@@ -209,7 +209,7 @@ async function run() {
       res.send(result);
     });
 
-    // change status (pending -> active)
+    // update status (pending -> active)
     app.patch("/riders/:id", async (req, res) => {
       const id = req.params.id;
 
